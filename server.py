@@ -9,12 +9,27 @@ from fastmcp import FastMCP
 # ---------------------------------------------------------
 
 def get_conn():
+    def clean_env_var(value, default=None):
+        """Strip quotes and whitespace from environment variable values"""
+        if value is None:
+            return default
+        # Remove surrounding quotes (single or double) and strip whitespace
+        value = value.strip().strip('"').strip("'")
+        return value if value else default
+    
+    def get_port():
+        port = clean_env_var(os.environ.get("DB_PORT"), "5432")
+        try:
+            return int(port)
+        except (ValueError, TypeError):
+            return 5432
+    
     return psycopg2.connect(
-        host=os.environ.get("DB_HOST"),
-        port=os.environ.get("DB_PORT", 5432),
-        dbname=os.environ.get("DB_NAME"),
-        user=os.environ.get("DB_USER"),
-        password=os.environ.get("DB_PASSWORD")
+        host=clean_env_var(os.environ.get("DB_HOST")),
+        port=get_port(),
+        dbname=clean_env_var(os.environ.get("DB_NAME")),
+        user=clean_env_var(os.environ.get("DB_USER")),
+        password=clean_env_var(os.environ.get("DB_PASSWORD"))
     )
 
 

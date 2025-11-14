@@ -112,6 +112,27 @@
         },
         "required": ["search_value"]
       }
+    },
+    "verify_table_exists": {
+      "description": "Check if a table exists in the specified schema. If not found, provides suggestions for similar table names and searches other schemas. Use this before querying tables to avoid errors.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "schema": { "type": "string" },
+          "table": { "type": "string" }
+        },
+        "required": ["schema", "table"]
+      }
+    },
+    "find_table_schema": {
+      "description": "Find which schema(s) contain a table with the given name. Useful when you know the table name but not which schema it's in. Example: find_table_schema('transition_matrix') will find all schemas containing this table.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "table_name": { "type": "string" }
+        },
+        "required": ["table_name"]
+      }
     }
   }
 }

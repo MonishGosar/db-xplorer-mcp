@@ -41,6 +41,102 @@ mcp = FastMCP("db-xplorer")
 
 
 # ---------------------------------------------------------
+# Helper: Check if table exists and get suggestions
+# ---------------------------------------------------------
+
+def check_table_exists(schema: str, table: str, conn=None):
+    """Check if a table exists and return suggestions if it doesn't"""
+    close_conn = False
+    if conn is None:
+        conn = get_conn()
+        close_conn = True
+    
+    cur = conn.cursor()
+    
+    try:
+        # Check if table exists
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = %s AND table_name = %s
+            );
+        """, (schema, table))
+        
+        exists = cur.fetchone()[0]
+        
+        if exists:
+            cur.close()
+            if close_conn:
+                conn.close()
+            return {"exists": True, "suggestions": []}
+        
+        # Table doesn't exist - find similar tables
+        suggestions = []
+        
+        # Find tables with similar names in the same schema
+        cur.execute("""
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = %s
+            AND table_name ILIKE %s
+            ORDER BY table_name
+            LIMIT 10;
+        """, (schema, f"%{table}%"))
+        
+        similar = [row[0] for row in cur.fetchall()]
+        suggestions.extend(similar)
+        
+        # Find tables with similar names in other schemas
+        cur.execute("""
+            SELECT table_schema, table_name
+            FROM information_schema.tables
+            WHERE table_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
+            AND table_name ILIKE %s
+            ORDER BY table_schema, table_name
+            LIMIT 10;
+        """, (f"%{table}%",))
+        
+        for row in cur.fetchall():
+            if row[0] != schema or row[1] != table:
+                suggestions.append(f"{row[0]}.{row[1]}")
+        
+        # Get all tables in the schema as fallback
+        if not suggestions:
+            cur.execute("""
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = %s
+                AND table_type = 'BASE TABLE'
+                ORDER BY table_name
+                LIMIT 20;
+            """, (schema,))
+            
+            all_tables = [row[0] for row in cur.fetchall()]
+            suggestions.extend(all_tables)
+        
+        cur.close()
+        if close_conn:
+            conn.close()
+        
+        return {
+            "exists": False,
+            "suggestions": list(set(suggestions))[:15],  # Remove duplicates, limit to 15
+            "message": f"Table '{schema}.{table}' does not exist"
+        }
+        
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        cur.close()
+        if close_conn:
+            conn.close()
+        return {"exists": False, "suggestions": [], "error": str(e)}
+
+
+# ---------------------------------------------------------
 # Tool: list_schemas
 # ---------------------------------------------------------
 
@@ -120,6 +216,20 @@ def list_tables(schema: str) -> dict:
 @mcp.tool()
 def describe_table(schema: str, table: str) -> dict:
     conn = get_conn()
+    
+    # Check if table exists first
+    check_result = check_table_exists(schema, table, conn)
+    if not check_result.get("exists", False):
+        conn.close()
+        return {
+            "schema": schema,
+            "table": table,
+            "error": check_result.get("message", f"Table '{schema}.{table}' does not exist"),
+            "suggestions": check_result.get("suggestions", [])[:10],
+            "found_in_other_schemas": check_result.get("similar_tables", []),
+            "hint": f"Did you mean one of these? {', '.join(check_result.get('suggestions', [])[:5])}" if check_result.get("suggestions") else f"Use 'list_tables' to see available tables in schema '{schema}' or 'find_table_schema' to search for '{table}'"
+        }
+    
     cur = conn.cursor()
 
     # meta info
@@ -279,26 +389,253 @@ def search_columns(pattern: str) -> dict:
 
 
 # ---------------------------------------------------------
+# Helper: Check if table exists and get suggestions
+# ---------------------------------------------------------
+
+def check_table_exists(schema: str, table: str, conn=None):
+    """
+    Check if a table exists in the given schema.
+    Returns suggestions for similar table names if not found.
+    Also searches other schemas if table not found in specified schema.
+    """
+    if conn is None:
+        conn = get_conn()
+        should_close = True
+    else:
+        should_close = False
+    
+    cur = conn.cursor()
+    result = {
+        "exists": False,
+        "schema": schema,
+        "table": table,
+        "actual_schema": None,
+        "suggestions": [],
+        "similar_tables": []
+    }
+    
+    try:
+        # First, check if table exists in the specified schema
+        cur.execute("""
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = %s AND table_name = %s;
+        """, (schema, table))
+        
+        if cur.fetchone():
+            result["exists"] = True
+            result["actual_schema"] = schema
+            if should_close:
+                cur.close()
+                conn.close()
+            return result
+        
+        # Table not found in specified schema - search for similar names
+        # 1. Search in the same schema for similar table names
+        cur.execute("""
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = %s
+            AND table_name ILIKE %s
+            ORDER BY table_name
+            LIMIT 10;
+        """, (schema, f"%{table}%"))
+        
+        similar_in_schema = [row[0] for row in cur.fetchall()]
+        result["suggestions"].extend([f"{schema}.{t}" for t in similar_in_schema])
+        
+        # 2. Search in ALL schemas for this table name
+        cur.execute("""
+            SELECT table_schema, table_name
+            FROM information_schema.tables
+            WHERE table_name = %s
+            AND table_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
+            ORDER BY table_schema;
+        """, (table,))
+        
+        found_in_schemas = cur.fetchall()
+        if found_in_schemas:
+            result["similar_tables"] = [{"schema": row[0], "table": row[1]} for row in found_in_schemas]
+            result["suggestions"].extend([f"{row[0]}.{row[1]}" for row in found_in_schemas])
+            result["message"] = f"Table '{table}' not found in schema '{schema}', but found in: {', '.join([row[0] for row in found_in_schemas])}"
+        
+        # 3. Search for similar table names across all schemas
+        cur.execute("""
+            SELECT table_schema, table_name
+            FROM information_schema.tables
+            WHERE table_name ILIKE %s
+            AND table_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
+            ORDER BY table_schema, table_name
+            LIMIT 15;
+        """, (f"%{table}%",))
+        
+        similar_all = cur.fetchall()
+        for row in similar_all:
+            suggestion = f"{row[0]}.{row[1]}"
+            if suggestion not in result["suggestions"]:
+                result["suggestions"].append(suggestion)
+        
+        if not result["suggestions"]:
+            result["message"] = f"Table '{schema}.{table}' does not exist. Use 'list_tables' to see available tables in schema '{schema}'"
+        elif not result["similar_tables"]:
+            result["message"] = f"Table '{table}' not found in schema '{schema}'. Similar tables: {', '.join(result['suggestions'][:5])}"
+        else:
+            result["message"] = f"Table '{table}' not in schema '{schema}'. Found in: {', '.join([t['schema'] for t in result['similar_tables']])}"
+        
+    except Exception as e:
+        result["message"] = f"Error checking table: {str(e)}"
+    finally:
+        if should_close:
+            cur.close()
+            conn.close()
+        else:
+            cur.close()
+    
+    return result
+
+
+# ---------------------------------------------------------
+# Tool: verify_table_exists
+# ---------------------------------------------------------
+
+@mcp.tool()
+def verify_table_exists(schema: str, table: str) -> dict:
+    """
+    Check if a table exists in the specified schema.
+    If not found, provides suggestions for similar table names and searches other schemas.
+    Use this before querying tables to avoid errors.
+    """
+    result = check_table_exists(schema, table)
+    
+    return {
+        "exists": result["exists"],
+        "schema": schema,
+        "table": table,
+        "actual_schema": result.get("actual_schema"),
+        "message": result.get("message", ""),
+        "suggestions": result.get("suggestions", [])[:10],
+        "found_in_other_schemas": result.get("similar_tables", [])
+    }
+
+
+# ---------------------------------------------------------
+# Tool: find_table_schema
+# ---------------------------------------------------------
+
+@mcp.tool()
+def find_table_schema(table_name: str) -> dict:
+    """
+    Find which schema(s) contain a table with the given name.
+    Useful when you know the table name but not which schema it's in.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    
+    try:
+        # Exact match
+        cur.execute("""
+            SELECT table_schema, table_name
+            FROM information_schema.tables
+            WHERE table_name = %s
+            AND table_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
+            ORDER BY table_schema;
+        """, (table_name,))
+        
+        exact_matches = [{"schema": row[0], "table": row[1]} for row in cur.fetchall()]
+        
+        # Similar matches (fuzzy)
+        cur.execute("""
+            SELECT table_schema, table_name
+            FROM information_schema.tables
+            WHERE table_name ILIKE %s
+            AND table_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
+            AND table_name != %s
+            ORDER BY table_schema, table_name
+            LIMIT 10;
+        """, (f"%{table_name}%", table_name))
+        
+        similar_matches = [{"schema": row[0], "table": row[1]} for row in cur.fetchall()]
+        
+        cur.close()
+        conn.close()
+        
+        return {
+            "table_name": table_name,
+            "exact_matches": exact_matches,
+            "similar_matches": similar_matches,
+            "found": len(exact_matches) > 0,
+            "message": f"Found in {len(exact_matches)} schema(s)" if exact_matches else f"Table '{table_name}' not found. Similar: {', '.join([m['schema'] + '.' + m['table'] for m in similar_matches[:5]])}"
+        }
+        
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        cur.close()
+        conn.close()
+        return {"error": str(e)}
+
+
+# ---------------------------------------------------------
 # Tool: preview_rows
 # ---------------------------------------------------------
 
 @mcp.tool()
 def preview_rows(schema: str, table: str, limit: int = 20) -> dict:
+    """
+    Preview first N rows of a table. Automatically verifies table exists first.
+    """
     conn = get_conn()
+    
+    # Check if table exists first
+    check_result = check_table_exists(schema, table, conn)
+    if not check_result.get("exists", False):
+        conn.close()
+        return {
+            "error": check_result.get("message", f"Table '{schema}.{table}' does not exist"),
+            "suggestions": check_result.get("suggestions", [])[:10],
+            "found_in_other_schemas": check_result.get("similar_tables", []),
+            "hint": f"Did you mean one of these? {', '.join(check_result.get('suggestions', [])[:5])}" if check_result.get("suggestions") else f"Use 'list_tables' to see available tables in schema '{schema}' or 'find_table_schema' to search for '{table}'"
+        }
+    
     cur = conn.cursor()
 
-    cur.execute(
-        f"SELECT * FROM {schema}.{table} LIMIT %s;",
-        (limit,)
-    )
+    try:
+        cur.execute(
+            f"SELECT * FROM {schema}.{table} LIMIT %s;",
+            (limit,)
+        )
 
-    cols = [d[0] for d in cur.description]
-    rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchall()
 
-    cur.close()
-    conn.close()
+        cur.close()
+        conn.close()
 
-    return {"columns": cols, "rows": rows}
+        return {
+            "schema": schema,
+            "table": table,
+            "columns": cols,
+            "rows": rows,
+            "row_count": len(rows)
+        }
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        cur.close()
+        conn.close()
+        
+        # Try to get suggestions even on error
+        check_result = check_table_exists(schema, table)
+        return {
+            "error": str(e),
+            "suggestions": check_result.get("suggestions", [])[:10],
+            "found_in_other_schemas": check_result.get("similar_tables", []),
+            "hint": f"Table may not exist. Try: {', '.join(check_result.get('suggestions', [])[:5])}" if check_result.get("suggestions") else "Use 'list_tables' to see available tables or 'find_table_schema' to search"
+        }
 
 
 # ---------------------------------------------------------
@@ -307,34 +644,65 @@ def preview_rows(schema: str, table: str, limit: int = 20) -> dict:
 
 @mcp.tool()
 def get_row_count(schema: str, table: str) -> dict:
+    """
+    Get approximate or exact row count for a table. Automatically verifies table exists first.
+    """
     conn = get_conn()
+    
+    # Check if table exists first
+    check_result = check_table_exists(schema, table, conn)
+    if not check_result.get("exists", False):
+        conn.close()
+        return {
+            "error": check_result.get("message", f"Table '{schema}.{table}' does not exist"),
+            "suggestions": check_result.get("suggestions", [])[:10],
+            "found_in_other_schemas": check_result.get("similar_tables", []),
+            "hint": f"Did you mean one of these? {', '.join(check_result.get('suggestions', [])[:5])}" if check_result.get("suggestions") else f"Use 'list_tables' to see available tables in schema '{schema}' or 'find_table_schema' to search for '{table}'"
+        }
+    
     cur = conn.cursor()
 
-    # estimate
-    cur.execute("""
-        SELECT reltuples::bigint
-        FROM pg_class
-        JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace
-        WHERE nspname=%s AND relname=%s;
-    """, (schema, table))
-    estimate = cur.fetchone()[0]
-
-    # exact count
     try:
-        cur.execute(f"SELECT COUNT(*) FROM {schema}.{table};")
-        exact = cur.fetchone()[0]
-    except Exception:
-        # Rollback if transaction was aborted
+        # estimate
+        cur.execute("""
+            SELECT reltuples::bigint
+            FROM pg_class
+            JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace
+            WHERE nspname=%s AND relname=%s;
+        """, (schema, table))
+        estimate = cur.fetchone()[0]
+
+        # exact count
+        try:
+            cur.execute(f"SELECT COUNT(*) FROM {schema}.{table};")
+            exact = cur.fetchone()[0]
+        except Exception:
+            # Rollback if transaction was aborted
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            exact = None
+
+        cur.close()
+        conn.close()
+
+        return {"row_estimate": estimate, "row_exact": exact}
+    except Exception as e:
         try:
             conn.rollback()
         except Exception:
             pass
-        exact = None
-
-    cur.close()
-    conn.close()
-
-    return {"row_estimate": estimate, "row_exact": exact}
+        cur.close()
+        conn.close()
+        
+        check_result = check_table_exists(schema, table)
+        return {
+            "error": str(e),
+            "suggestions": check_result.get("suggestions", [])[:10],
+            "found_in_other_schemas": check_result.get("similar_tables", []),
+            "hint": f"Table may not exist. Try: {', '.join(check_result.get('suggestions', [])[:5])}" if check_result.get("suggestions") else "Use 'list_tables' to see available tables or 'find_table_schema' to search"
+        }
 
 
 # ---------------------------------------------------------
@@ -379,9 +747,29 @@ def run_query_safe(sql: str) -> dict:
         cols = [d[0] for d in cur.description]
         rows = cur.fetchall()
     except Exception as e:
+        error_msg = str(e)
         cur.close()
         conn.close()
-        return {"error": str(e)}
+        
+        # Try to extract table name from error and suggest alternatives
+        suggestions = []
+        if "does not exist" in error_msg or "relation" in error_msg:
+            # Try to extract schema.table from error
+            match = re.search(r'relation\s+"?([^."]+)\.([^."]+)"?', error_msg, re.IGNORECASE)
+            if match:
+                schema = match.group(1)
+                table = match.group(2)
+                check_result = check_table_exists(schema, table)
+                suggestions = check_result.get("suggestions", [])
+        
+        result = {"error": error_msg}
+        if suggestions:
+            result["suggestions"] = suggestions
+            result["hint"] = f"Table may not exist. Did you mean: {', '.join(suggestions[:5])}"
+        else:
+            result["hint"] = "Check the table name and schema. Use 'list_tables' to see available tables."
+        
+        return result
 
     cur.close()
     conn.close()
@@ -506,6 +894,17 @@ def deep_search(schema: str, table: str, search_term: str, limit: int = 100) -> 
     Searches across all text/varchar columns in the specified table.
     """
     conn = get_conn()
+    
+    # Check if table exists first
+    check_result = check_table_exists(schema, table, conn)
+    if not check_result.get("exists", False):
+        conn.close()
+        return {
+            "error": check_result.get("message", f"Table '{schema}.{table}' does not exist"),
+            "suggestions": check_result.get("suggestions", []),
+            "hint": f"Did you mean one of these? {', '.join(check_result.get('suggestions', [])[:5])}" if check_result.get("suggestions") else f"Use 'list_tables' to see available tables in schema '{schema}'"
+        }
+    
     cur = conn.cursor()
     
     try:
@@ -1060,6 +1459,36 @@ def find_data_by_value(search_value: str, data_type: str = "text") -> dict:
         cur.close()
         conn.close()
         return {"error": str(e)}
+
+
+# ---------------------------------------------------------
+# Tool: verify_table_exists - Check table and get suggestions
+# ---------------------------------------------------------
+
+@mcp.tool()
+def verify_table_exists(schema: str, table: str) -> dict:
+    """
+    Check if a table exists and get suggestions for similar table names if it doesn't.
+    Use this before querying tables to avoid errors.
+    """
+    result = check_table_exists(schema, table)
+    
+    if result.get("exists", False):
+        return {
+            "exists": True,
+            "schema": schema,
+            "table": table,
+            "message": f"Table '{schema}.{table}' exists and is ready to query"
+        }
+    else:
+        return {
+            "exists": False,
+            "schema": schema,
+            "table": table,
+            "error": result.get("message", f"Table '{schema}.{table}' does not exist"),
+            "suggestions": result.get("suggestions", []),
+            "hint": f"Did you mean one of these? {', '.join(result.get('suggestions', [])[:10])}" if result.get("suggestions") else f"Use 'list_tables' with schema '{schema}' to see all available tables"
+        }
 
 
 # ---------------------------------------------------------

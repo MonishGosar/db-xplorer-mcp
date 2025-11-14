@@ -24,13 +24,16 @@ def get_conn():
         except (ValueError, TypeError):
             return 5432
     
-    return psycopg2.connect(
+    conn = psycopg2.connect(
         host=clean_env_var(os.environ.get("DB_HOST")),
         port=get_port(),
         dbname=clean_env_var(os.environ.get("DB_NAME")),
         user=clean_env_var(os.environ.get("DB_USER")),
         password=clean_env_var(os.environ.get("DB_PASSWORD"))
     )
+    # Enable autocommit for read-only queries to avoid transaction aborted errors
+    conn.autocommit = True
+    return conn
 
 
 mcp = FastMCP("db-xplorer")
@@ -79,7 +82,12 @@ def list_tables(schema: str) -> dict:
             WHERE schema_name = %s;
         """, (schema,))
         desc_map = {r[0]: r[1] for r in cur.fetchall()}
-    except:
+    except Exception:
+        # Rollback if transaction was aborted
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         desc_map = {}
 
     # row estimates
@@ -124,19 +132,43 @@ def describe_table(schema: str, table: str) -> dict:
         row = cur.fetchone()
         description = row[0] if row else ""
         grain = row[1] if row else ""
-    except:
+    except Exception:
+        # Rollback if transaction was aborted
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         description = ""
         grain = ""
 
     # all columns
-    cur.execute("""
-        SELECT column_name, data_type
-        FROM information_schema.columns
-        WHERE table_schema=%s AND table_name=%s
-        ORDER BY ordinal_position;
-    """, (schema, table))
+    try:
+        cur.execute("""
+            SELECT column_name, data_type
+            FROM information_schema.columns
+            WHERE table_schema=%s AND table_name=%s
+            ORDER BY ordinal_position;
+        """, (schema, table))
 
-    columns = cur.fetchall()
+        columns = cur.fetchall()
+    except Exception:
+        # Rollback if transaction was aborted
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        cur.close()
+        conn.close()
+        return {
+            "schema": schema,
+            "table": table,
+            "description": "",
+            "grain": "",
+            "dimensions": [],
+            "measures": [],
+            "sample_columns": [],
+            "error": "Failed to fetch table information"
+        }
 
     # dimensions/measures metadata
     try:
@@ -147,7 +179,12 @@ def describe_table(schema: str, table: str) -> dict:
         """, (schema, table))
 
         meta = cur.fetchall()
-    except:
+    except Exception:
+        # Rollback if transaction was aborted
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         meta = []
 
     dim_list, meas_list = [], []
@@ -215,7 +252,14 @@ def search_columns(pattern: str) -> dict:
             WHERE column_name ILIKE %s OR description ILIKE %s
             ORDER BY schema_name, table_name;
         """, (f"%{pattern}%", f"%{pattern}%"))
-    except:
+    except Exception:
+        # Rollback if transaction was aborted
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        cur.close()
+        conn.close()
         return {"columns": []}
 
     out = []
@@ -278,7 +322,12 @@ def get_row_count(schema: str, table: str) -> dict:
     try:
         cur.execute(f"SELECT COUNT(*) FROM {schema}.{table};")
         exact = cur.fetchone()[0]
-    except:
+    except Exception:
+        # Rollback if transaction was aborted
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         exact = None
 
     cur.close()

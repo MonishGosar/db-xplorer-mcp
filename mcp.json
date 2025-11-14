@@ -92,7 +92,7 @@
       }
     },
     "analyze_data": {
-      "description": "Analyze data based on natural language queries. Example: 'what is precision for nov 23' - automatically searches schemas, tables, columns, extracts dates, and finds relevant data.",
+      "description": "Analyze data based on ANY natural language query - handles typos, variations, flexible matching. Works with any question like 'what is prediction for nov 23', 'show me accuracy data', 'find precision metrics'. Automatically searches schemas, tables, columns with multiple fallback strategies.",
       "input_schema": {
         "type": "object",
         "properties": {

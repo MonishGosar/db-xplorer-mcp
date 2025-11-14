@@ -2,6 +2,7 @@ import os
 import psycopg2
 import re
 from fastmcp import FastMCP
+from difflib import SequenceMatcher
 
 
 # ---------------------------------------------------------
@@ -586,41 +587,103 @@ def deep_search(schema: str, table: str, search_term: str, limit: int = 100) -> 
 
 
 # ---------------------------------------------------------
-# Tool: analyze_data - Natural language query analysis
+# Helper: Fuzzy similarity matching
+# ---------------------------------------------------------
+
+def similarity(a, b):
+    """Calculate similarity ratio between two strings"""
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+def extract_keywords_flexible(query: str):
+    """
+    Extract keywords from query with flexible matching.
+    Handles typos, variations, and partial matches.
+    """
+    # Common stop words to ignore
+    stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
+                  'of', 'with', 'by', 'from', 'is', 'are', 'was', 'were', 'what', 'where',
+                  'when', 'who', 'how', 'which', 'that', 'this', 'these', 'those'}
+    
+    query_lower = query.lower()
+    
+    # Extract all words, filtering stop words and very short words
+    words = [w.strip('.,!?;:()[]{}') for w in query_lower.split()]
+    keywords = [w for w in words if len(w) > 2 and w not in stop_words]
+    
+    # Also try to extract phrases (2-3 word combinations)
+    phrases = []
+    for i in range(len(keywords) - 1):
+        phrases.append(f"{keywords[i]} {keywords[i+1]}")
+    for i in range(len(keywords) - 2):
+        phrases.append(f"{keywords[i]} {keywords[i+1]} {keywords[i+2]}")
+    
+    return keywords, phrases
+
+def generate_search_patterns(term: str):
+    """
+    Generate multiple search patterns for fuzzy matching.
+    Handles typos and variations.
+    """
+    patterns = []
+    term_lower = term.lower()
+    
+    # Exact match
+    patterns.append(f"%{term_lower}%")
+    
+    # Partial matches (first 3+ chars)
+    if len(term_lower) > 3:
+        patterns.append(f"%{term_lower[:3]}%")
+        patterns.append(f"%{term_lower[:4]}%")
+    
+    # Common variations/typos
+    variations = {
+        'prediction': ['prediction', 'predict', 'predicted', 'predictions'],
+        'precision': ['precision', 'precise', 'precisely'],
+        'accuracy': ['accuracy', 'accurate', 'accurately'],
+        'november': ['nov', 'november', '11'],
+        'december': ['dec', 'december', '12'],
+    }
+    
+    for key, variants in variations.items():
+        if key in term_lower or any(v in term_lower for v in variants):
+            patterns.extend([f"%{v}%" for v in variants])
+    
+    return list(set(patterns))  # Remove duplicates
+
+
+# ---------------------------------------------------------
+# Tool: analyze_data - Natural language query analysis (ROBUST VERSION)
 # ---------------------------------------------------------
 
 @mcp.tool()
 def analyze_data(query: str, date_filter: str = None) -> dict:
     """
-    Analyze data based on natural language queries.
-    Example: "what is precision for nov 23" will search for precision-related data
-    in November 2023. Automatically searches schemas, tables, and columns.
+    Analyze data based on ANY natural language query - handles typos, variations, and flexible matching.
+    Example: "what is precision for nov 23" or "show me prediction data november" - works with any query.
+    Automatically searches schemas, tables, columns with multiple strategies and fallbacks.
     """
     conn = get_conn()
     cur = conn.cursor()
     
     query_lower = query.lower()
     
-    # Extract key terms from query
-    keywords = []
-    for word in query_lower.split():
-        if len(word) > 3:  # Ignore short words like "the", "for", etc.
-            keywords.append(word)
+    # Extract keywords flexibly
+    keywords, phrases = extract_keywords_flexible(query)
     
-    # Extract date information
+    # Extract date information (more flexible)
     date_patterns = {
-        "nov": "11", "november": "11",
-        "dec": "12", "december": "12",
-        "jan": "01", "january": "01",
-        "feb": "02", "february": "02",
-        "mar": "03", "march": "03",
-        "apr": "04", "april": "04",
+        "nov": "11", "november": "11", "nov.": "11",
+        "dec": "12", "december": "12", "dec.": "12",
+        "jan": "01", "january": "01", "jan.": "01",
+        "feb": "02", "february": "02", "feb.": "02",
+        "mar": "03", "march": "03", "mar.": "03",
+        "apr": "04", "april": "04", "apr.": "04",
         "may": "05",
-        "jun": "06", "june": "06",
-        "jul": "07", "july": "07",
-        "aug": "08", "august": "08",
-        "sep": "09", "september": "09",
-        "oct": "10", "october": "10"
+        "jun": "06", "june": "06", "jun.": "06",
+        "jul": "07", "july": "07", "jul.": "07",
+        "aug": "08", "august": "08", "aug.": "08",
+        "sep": "09", "september": "09", "sep.": "09",
+        "oct": "10", "october": "10", "oct.": "10"
     }
     
     month = None
@@ -630,15 +693,26 @@ def analyze_data(query: str, date_filter: str = None) -> dict:
             month = value
             break
     
-    # Try to extract year (23, 2023, etc.)
-    year_match = re.search(r'\b(20\d{2}|\d{2})\b', query_lower)
-    if year_match:
-        year_str = year_match.group(1)
-        year = f"20{year_str}" if len(year_str) == 2 else year_str
+    # Try to extract year (23, 2023, etc.) - more flexible
+    year_patterns = [
+        r'\b(20\d{2})\b',  # 2023, 2024, etc.
+        r'\b(\d{2})\b',    # 23, 24, etc.
+        r'\b(\d{4})\b'     # Any 4-digit year
+    ]
+    for pattern in year_patterns:
+        year_match = re.search(pattern, query_lower)
+        if year_match:
+            year_str = year_match.group(1)
+            if len(year_str) == 2:
+                year = f"20{year_str}"
+            else:
+                year = year_str
+            break
     
     results = {
         "query": query,
         "extracted_keywords": keywords,
+        "extracted_phrases": phrases,
         "date_info": {
             "month": month,
             "year": year,
@@ -646,68 +720,169 @@ def analyze_data(query: str, date_filter: str = None) -> dict:
         },
         "found_tables": [],
         "found_columns": [],
-        "sample_data": []
+        "sample_data": [],
+        "search_strategies_used": []
     }
     
     try:
-        # First, do a smart search to find relevant tables/columns
-        search_query = " ".join(keywords[:3])
-        query_pattern = f"%{search_query.lower()}%"
+        # Strategy 1: Try exact/partial keyword matching
+        if keywords:
+            search_terms = keywords[:5]  # Use top 5 keywords
+            for term in search_terms:
+                patterns = generate_search_patterns(term)
+                for pattern in patterns[:3]:  # Limit patterns per term
+                    try:
+                        # Search tables
+                        cur.execute("""
+                            SELECT table_schema, table_name
+                            FROM information_schema.tables
+                            WHERE table_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
+                            AND (table_schema ILIKE %s OR table_name ILIKE %s)
+                            ORDER BY table_schema, table_name
+                            LIMIT 20;
+                        """, (pattern, pattern))
+                        
+                        for row in cur.fetchall():
+                            table_info = {"schema": row[0], "table": row[1]}
+                            if table_info not in results["found_tables"]:
+                                results["found_tables"].append(table_info)
+                        
+                        # Search columns
+                        cur.execute("""
+                            SELECT table_schema, table_name, column_name, data_type
+                            FROM information_schema.columns
+                            WHERE table_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
+                            AND column_name ILIKE %s
+                            ORDER BY table_schema, table_name, column_name
+                            LIMIT 30;
+                        """, (pattern,))
+                        
+                        for row in cur.fetchall():
+                            col_info = {
+                                "schema": row[0],
+                                "table": row[1],
+                                "column": row[2],
+                                "data_type": row[3]
+                            }
+                            if col_info not in results["found_columns"]:
+                                results["found_columns"].append(col_info)
+                    except Exception:
+                        continue
+            
+            results["search_strategies_used"].append("keyword_pattern_matching")
         
-        # Search tables
-        cur.execute("""
-            SELECT table_schema, table_name
-            FROM information_schema.tables
-            WHERE table_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
-            AND (table_schema ILIKE %s OR table_name ILIKE %s)
-            ORDER BY table_schema, table_name
-            LIMIT 30;
-        """, (query_pattern, query_pattern))
-        results["found_tables"] = [{"schema": row[0], "table": row[1]} for row in cur.fetchall()]
+        # Strategy 2: Try phrase matching if keywords didn't find much
+        if len(results["found_tables"]) < 5 and phrases:
+            for phrase in phrases[:3]:
+                try:
+                    pattern = f"%{phrase}%"
+                    cur.execute("""
+                        SELECT table_schema, table_name
+                        FROM information_schema.tables
+                        WHERE table_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
+                        AND (table_schema ILIKE %s OR table_name ILIKE %s)
+                        ORDER BY table_schema, table_name
+                        LIMIT 10;
+                    """, (pattern, pattern))
+                    
+                    for row in cur.fetchall():
+                        table_info = {"schema": row[0], "table": row[1]}
+                        if table_info not in results["found_tables"]:
+                            results["found_tables"].append(table_info)
+                except Exception:
+                    continue
+            
+            results["search_strategies_used"].append("phrase_matching")
         
-        # Search columns
-        cur.execute("""
-            SELECT table_schema, table_name, column_name, data_type
-            FROM information_schema.columns
-            WHERE table_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
-            AND column_name ILIKE %s
-            ORDER BY table_schema, table_name, column_name
-            LIMIT 50;
-        """, (query_pattern,))
-        results["found_columns"] = [
-            {
-                "schema": row[0],
-                "table": row[1],
-                "column": row[2],
-                "data_type": row[3]
-            }
-            for row in cur.fetchall()
-        ]
+        # Strategy 3: If still not enough, search ALL interesting schemas and list their tables
+        if len(results["found_tables"]) < 3:
+            try:
+                cur.execute("""
+                    SELECT schema_name
+                    FROM information_schema.schemata
+                    WHERE schema_name LIKE 'collections_%'
+                       OR schema_name LIKE 'recovery_%'
+                       OR schema_name = 'gold'
+                    ORDER BY schema_name
+                    LIMIT 10;
+                """)
+                
+                schemas = [row[0] for row in cur.fetchall()]
+                for schema in schemas:
+                    cur.execute("""
+                        SELECT table_name
+                        FROM information_schema.tables
+                        WHERE table_schema = %s
+                        AND table_type = 'BASE TABLE'
+                        ORDER BY table_name
+                        LIMIT 10;
+                    """, (schema,))
+                    
+                    for row in cur.fetchall():
+                        table_info = {"schema": schema, "table": row[0]}
+                        if table_info not in results["found_tables"]:
+                            results["found_tables"].append(table_info)
+                            if len(results["found_tables"]) >= 10:
+                                break
+                    if len(results["found_tables"]) >= 10:
+                        break
+                
+                results["search_strategies_used"].append("schema_exploration_fallback")
+            except Exception:
+                pass
         
-        # Try to find date columns
+        # Try to find date columns (more flexible matching)
         date_columns = []
+        date_keywords = ["date", "time", "created", "updated", "month", "year", "day", "timestamp", "dt"]
         for col_info in results["found_columns"]:
             col_name = col_info.get("column", "").lower()
-            if any(term in col_name for term in ["date", "time", "created", "updated", "month", "year"]):
+            if any(term in col_name for term in date_keywords):
                 date_columns.append(col_info)
+        
+        # Also search for date columns in all found tables
+        for table_info in results["found_tables"][:5]:
+            try:
+                schema = table_info["schema"]
+                table = table_info["table"]
+                cur.execute("""
+                    SELECT column_name, data_type
+                    FROM information_schema.columns
+                    WHERE table_schema = %s AND table_name = %s
+                    AND (column_name ILIKE %s OR column_name ILIKE %s OR column_name ILIKE %s
+                         OR data_type IN ('date', 'timestamp', 'timestamp without time zone', 'timestamp with time zone'))
+                    ORDER BY ordinal_position
+                    LIMIT 10;
+                """, (schema, table, "%date%", "%time%", "%month%"))
+                
+                for row in cur.fetchall():
+                    col_info = {
+                        "schema": schema,
+                        "table": table,
+                        "column": row[0],
+                        "data_type": row[1]
+                    }
+                    if col_info not in date_columns:
+                        date_columns.append(col_info)
+            except Exception:
+                continue
         
         results["date_columns_found"] = date_columns
         
-        # If we found relevant tables, try to query them
+        # If we found relevant tables, try to query them and get sample data
         if results["found_tables"]:
             # Take the first few relevant tables
-            for table_info in results["found_tables"][:3]:
+            for table_info in results["found_tables"][:5]:
                 schema = table_info["schema"]
                 table = table_info["table"]
                 
                 try:
-                    # Build a query to search for the keywords
-                    cur.execute(f"""
+                    # Get all columns
+                    cur.execute("""
                         SELECT column_name, data_type
                         FROM information_schema.columns
                         WHERE table_schema = %s AND table_name = %s
                         ORDER BY ordinal_position
-                        LIMIT 20;
+                        LIMIT 30;
                     """, (schema, table))
                     
                     columns = cur.fetchall()
@@ -715,33 +890,60 @@ def analyze_data(query: str, date_filter: str = None) -> dict:
                     
                     if col_names:
                         # Try to get sample data
-                        sample_query = f"SELECT * FROM {schema}.{table} LIMIT 10;"
-                        cur.execute(sample_query)
-                        sample_cols = [d[0] for d in cur.description]
-                        sample_rows = cur.fetchall()
-                        
-                        results["sample_data"].append({
-                            "schema": schema,
-                            "table": table,
-                            "columns": col_names,
-                            "sample_rows": [
-                                dict(zip(sample_cols, row))
-                                for row in sample_rows[:5]
-                            ]
-                        })
+                        try:
+                            sample_query = f"SELECT * FROM {schema}.{table} LIMIT 10;"
+                            cur.execute(sample_query)
+                            sample_cols = [d[0] for d in cur.description]
+                            sample_rows = cur.fetchall()
+                            
+                            results["sample_data"].append({
+                                "schema": schema,
+                                "table": table,
+                                "columns": col_names,
+                                "sample_rows": [
+                                    dict(zip(sample_cols, row))
+                                    for row in sample_rows[:5]
+                                ]
+                            })
+                        except Exception:
+                            # If we can't get sample data, at least return column info
+                            results["sample_data"].append({
+                                "schema": schema,
+                                "table": table,
+                                "columns": col_names,
+                                "sample_rows": [],
+                                "note": "Could not fetch sample data"
+                            })
                 except Exception:
                     continue
         
         cur.close()
         conn.close()
         
+        # Generate helpful recommendations
+        recommendations = []
+        if results["found_tables"]:
+            recommendations.append(f"Found {len(results['found_tables'])} relevant tables")
+        else:
+            recommendations.append("No exact matches found - try exploring schemas with 'list_schemas'")
+        
+        if results["found_columns"]:
+            recommendations.append(f"Found {len(results['found_columns'])} relevant columns")
+        
+        if date_columns:
+            recommendations.append(f"Found {len(date_columns)} date/time columns for filtering")
+        
+        if month or year:
+            recommendations.append(f"Date filter: {month or 'any'}/{year or 'any'}")
+        
+        recommendations.append("Use 'preview_rows' to see actual data")
+        recommendations.append("Use 'deep_search' to search inside specific tables")
+        recommendations.append("Use 'run_query_safe' to run custom queries")
+        
         return {
             "analysis": results,
-            "recommendations": [
-                f"Found {len(results['found_tables'])} relevant tables",
-                f"Found {len(results['found_columns'])} relevant columns",
-                "Use 'preview_rows' or 'run_query_safe' to explore specific tables"
-            ]
+            "recommendations": recommendations,
+            "success": len(results["found_tables"]) > 0 or len(results["found_columns"]) > 0
         }
         
     except Exception as e:
@@ -751,7 +953,11 @@ def analyze_data(query: str, date_filter: str = None) -> dict:
             pass
         cur.close()
         conn.close()
-        return {"error": str(e), "partial_results": results}
+        return {
+            "error": str(e),
+            "partial_results": results,
+            "message": "Search encountered an error but partial results may be available"
+        }
 
 
 # ---------------------------------------------------------

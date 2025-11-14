@@ -1,0 +1,72 @@
+{
+  "name": "db-xplorer",
+  "version": "0.0.2",
+  "entrypoint": "server.py",
+  "tools": {
+    "list_schemas": {
+      "description": "List all interesting schemas (collections_*, recovery_*, gold, etc.)",
+      "input_schema": { "type": "object", "properties": {} }
+    },
+    "list_tables": {
+      "description": "List all tables inside a schema with row_estimate and description",
+      "input_schema": {
+        "type": "object",
+        "properties": { "schema": { "type": "string" } },
+        "required": ["schema"]
+      }
+    },
+    "describe_table": {
+      "description": "Describe columns, grain, dimensions, measures, and sample metadata",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "schema": { "type": "string" },
+          "table": { "type": "string" }
+        },
+        "required": ["schema", "table"]
+      }
+    },
+    "search_columns": {
+      "description": "Search for columns by name or description across all schemas",
+      "input_schema": {
+        "type": "object",
+        "properties": { "pattern": { "type": "string" } },
+        "required": ["pattern"]
+      }
+    },
+    "preview_rows": {
+      "description": "Preview first N rows of a table",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "schema": { "type": "string" },
+          "table": { "type": "string" },
+          "limit": { "type": "integer" }
+        },
+        "required": ["schema", "table"]
+      }
+    },
+    "get_row_count": {
+      "description": "Get approximate or exact row count for a table",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "schema": { "type": "string" },
+          "table": { "type": "string" }
+        },
+        "required": ["schema", "table"]
+      }
+    },
+    "run_query_safe": {
+      "description": "Run a safe SELECT query with guards and auto LIMIT",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "sql": { "type": "string" }
+        },
+        "required": ["sql"]
+      }
+    }
+  }
+}
+

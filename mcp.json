@@ -66,6 +66,52 @@
         },
         "required": ["sql"]
       }
+    },
+    "smart_search": {
+      "description": "Comprehensive search across schemas, tables, columns, and metadata. Searches for query term everywhere.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string" },
+          "max_results": { "type": "integer" }
+        },
+        "required": ["query"]
+      }
+    },
+    "deep_search": {
+      "description": "Search for a term inside actual table data. Searches across all text columns in a specific table.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "schema": { "type": "string" },
+          "table": { "type": "string" },
+          "search_term": { "type": "string" },
+          "limit": { "type": "integer" }
+        },
+        "required": ["schema", "table", "search_term"]
+      }
+    },
+    "analyze_data": {
+      "description": "Analyze data based on natural language queries. Example: 'what is precision for nov 23' - automatically searches schemas, tables, columns, extracts dates, and finds relevant data.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string" },
+          "date_filter": { "type": "string" }
+        },
+        "required": ["query"]
+      }
+    },
+    "find_data_by_value": {
+      "description": "Find which tables and rows contain a specific value. Searches across all tables in interesting schemas.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "search_value": { "type": "string" },
+          "data_type": { "type": "string" }
+        },
+        "required": ["search_value"]
+      }
     }
   }
 }

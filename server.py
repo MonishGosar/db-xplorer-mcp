@@ -389,6 +389,474 @@ def run_query_safe(sql: str) -> dict:
 
 
 # ---------------------------------------------------------
+# Tool: smart_search - Comprehensive search across everything
+# ---------------------------------------------------------
+
+@mcp.tool()
+def smart_search(query: str, max_results: int = 50) -> dict:
+    """
+    Comprehensive search across schemas, tables, columns, and data.
+    Searches for the query term in schema names, table names, column names,
+    column descriptions, and actual data values.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    
+    query_lower = query.lower()
+    query_pattern = f"%{query_lower}%"
+    
+    results = {
+        "schemas": [],
+        "tables": [],
+        "columns": [],
+        "data_matches": []
+    }
+    
+    try:
+        # Search schemas
+        cur.execute("""
+            SELECT schema_name
+            FROM information_schema.schemata
+            WHERE schema_name ILIKE %s
+            ORDER BY schema_name
+            LIMIT 20;
+        """, (query_pattern,))
+        results["schemas"] = [row[0] for row in cur.fetchall()]
+        
+        # Search tables across all schemas
+        cur.execute("""
+            SELECT table_schema, table_name
+            FROM information_schema.tables
+            WHERE table_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
+            AND (table_schema ILIKE %s OR table_name ILIKE %s)
+            ORDER BY table_schema, table_name
+            LIMIT 30;
+        """, (query_pattern, query_pattern))
+        results["tables"] = [{"schema": row[0], "table": row[1]} for row in cur.fetchall()]
+        
+        # Search columns
+        cur.execute("""
+            SELECT table_schema, table_name, column_name, data_type
+            FROM information_schema.columns
+            WHERE table_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
+            AND column_name ILIKE %s
+            ORDER BY table_schema, table_name, column_name
+            LIMIT 50;
+        """, (query_pattern,))
+        results["columns"] = [
+            {
+                "schema": row[0],
+                "table": row[1],
+                "column": row[2],
+                "data_type": row[3]
+            }
+            for row in cur.fetchall()
+        ]
+        
+        # Search in metadata descriptions if available
+        try:
+            cur.execute("""
+                SELECT schema_name, table_name, column_name, description
+                FROM metadata.column_description
+                WHERE description ILIKE %s
+                ORDER BY schema_name, table_name
+                LIMIT 30;
+            """, (query_pattern,))
+            for row in cur.fetchall():
+                results["columns"].append({
+                    "schema": row[0],
+                    "table": row[1],
+                    "column": row[2],
+                    "description": row[3],
+                    "matched_in": "description"
+                })
+        except Exception:
+            pass
+        
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return {"error": str(e), "results": results}
+    
+    cur.close()
+    conn.close()
+    
+    return {
+        "query": query,
+        "total_matches": {
+            "schemas": len(results["schemas"]),
+            "tables": len(results["tables"]),
+            "columns": len(results["columns"])
+        },
+        "results": results
+    }
+
+
+# ---------------------------------------------------------
+# Tool: deep_search - Search inside table data
+# ---------------------------------------------------------
+
+@mcp.tool()
+def deep_search(schema: str, table: str, search_term: str, limit: int = 100) -> dict:
+    """
+    Search for a term inside actual table data.
+    Searches across all text/varchar columns in the specified table.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    
+    try:
+        # Get all text/varchar columns
+        cur.execute("""
+            SELECT column_name, data_type
+            FROM information_schema.columns
+            WHERE table_schema = %s
+            AND table_name = %s
+            AND data_type IN ('text', 'varchar', 'character varying', 'char')
+            ORDER BY ordinal_position;
+        """, (schema, table))
+        
+        text_columns = cur.fetchall()
+        
+        if not text_columns:
+            cur.close()
+            conn.close()
+            return {
+                "schema": schema,
+                "table": table,
+                "search_term": search_term,
+                "message": "No text/varchar columns found in this table",
+                "matches": []
+            }
+        
+        # Build search query across all text columns
+        search_pattern = f"%{search_term}%"
+        column_names = [col[0] for col in text_columns]
+        
+        # Create OR conditions for all text columns
+        conditions = " OR ".join([f"{col}::text ILIKE %s" for col in column_names])
+        
+        query = f"""
+            SELECT *
+            FROM {schema}.{table}
+            WHERE {conditions}
+            LIMIT %s;
+        """
+        
+        params = tuple([search_pattern] * len(column_names) + [limit])
+        
+        cur.execute(query, params)
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+        
+        matches = []
+        for row in rows:
+            match_info = {}
+            for idx, col_name in enumerate(cols):
+                if col_name in column_names and row[idx] and search_term.lower() in str(row[idx]).lower():
+                    match_info[col_name] = str(row[idx])
+            if match_info:
+                matches.append({
+                    "row_data": dict(zip(cols, row)),
+                    "matched_columns": match_info
+                })
+        
+        cur.close()
+        conn.close()
+        
+        return {
+            "schema": schema,
+            "table": table,
+            "search_term": search_term,
+            "columns_searched": column_names,
+            "total_matches": len(matches),
+            "matches": matches[:limit]
+        }
+        
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        cur.close()
+        conn.close()
+        return {"error": str(e)}
+
+
+# ---------------------------------------------------------
+# Tool: analyze_data - Natural language query analysis
+# ---------------------------------------------------------
+
+@mcp.tool()
+def analyze_data(query: str, date_filter: str = None) -> dict:
+    """
+    Analyze data based on natural language queries.
+    Example: "what is precision for nov 23" will search for precision-related data
+    in November 2023. Automatically searches schemas, tables, and columns.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    
+    query_lower = query.lower()
+    
+    # Extract key terms from query
+    keywords = []
+    for word in query_lower.split():
+        if len(word) > 3:  # Ignore short words like "the", "for", etc.
+            keywords.append(word)
+    
+    # Extract date information
+    date_patterns = {
+        "nov": "11", "november": "11",
+        "dec": "12", "december": "12",
+        "jan": "01", "january": "01",
+        "feb": "02", "february": "02",
+        "mar": "03", "march": "03",
+        "apr": "04", "april": "04",
+        "may": "05",
+        "jun": "06", "june": "06",
+        "jul": "07", "july": "07",
+        "aug": "08", "august": "08",
+        "sep": "09", "september": "09",
+        "oct": "10", "october": "10"
+    }
+    
+    month = None
+    year = None
+    for key, value in date_patterns.items():
+        if key in query_lower:
+            month = value
+            break
+    
+    # Try to extract year (23, 2023, etc.)
+    year_match = re.search(r'\b(20\d{2}|\d{2})\b', query_lower)
+    if year_match:
+        year_str = year_match.group(1)
+        year = f"20{year_str}" if len(year_str) == 2 else year_str
+    
+    results = {
+        "query": query,
+        "extracted_keywords": keywords,
+        "date_info": {
+            "month": month,
+            "year": year,
+            "date_filter": date_filter
+        },
+        "found_tables": [],
+        "found_columns": [],
+        "sample_data": []
+    }
+    
+    try:
+        # First, do a smart search to find relevant tables/columns
+        search_query = " ".join(keywords[:3])
+        query_pattern = f"%{search_query.lower()}%"
+        
+        # Search tables
+        cur.execute("""
+            SELECT table_schema, table_name
+            FROM information_schema.tables
+            WHERE table_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
+            AND (table_schema ILIKE %s OR table_name ILIKE %s)
+            ORDER BY table_schema, table_name
+            LIMIT 30;
+        """, (query_pattern, query_pattern))
+        results["found_tables"] = [{"schema": row[0], "table": row[1]} for row in cur.fetchall()]
+        
+        # Search columns
+        cur.execute("""
+            SELECT table_schema, table_name, column_name, data_type
+            FROM information_schema.columns
+            WHERE table_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
+            AND column_name ILIKE %s
+            ORDER BY table_schema, table_name, column_name
+            LIMIT 50;
+        """, (query_pattern,))
+        results["found_columns"] = [
+            {
+                "schema": row[0],
+                "table": row[1],
+                "column": row[2],
+                "data_type": row[3]
+            }
+            for row in cur.fetchall()
+        ]
+        
+        # Try to find date columns
+        date_columns = []
+        for col_info in results["found_columns"]:
+            col_name = col_info.get("column", "").lower()
+            if any(term in col_name for term in ["date", "time", "created", "updated", "month", "year"]):
+                date_columns.append(col_info)
+        
+        results["date_columns_found"] = date_columns
+        
+        # If we found relevant tables, try to query them
+        if results["found_tables"]:
+            # Take the first few relevant tables
+            for table_info in results["found_tables"][:3]:
+                schema = table_info["schema"]
+                table = table_info["table"]
+                
+                try:
+                    # Build a query to search for the keywords
+                    cur.execute(f"""
+                        SELECT column_name, data_type
+                        FROM information_schema.columns
+                        WHERE table_schema = %s AND table_name = %s
+                        ORDER BY ordinal_position
+                        LIMIT 20;
+                    """, (schema, table))
+                    
+                    columns = cur.fetchall()
+                    col_names = [col[0] for col in columns]
+                    
+                    if col_names:
+                        # Try to get sample data
+                        sample_query = f"SELECT * FROM {schema}.{table} LIMIT 10;"
+                        cur.execute(sample_query)
+                        sample_cols = [d[0] for d in cur.description]
+                        sample_rows = cur.fetchall()
+                        
+                        results["sample_data"].append({
+                            "schema": schema,
+                            "table": table,
+                            "columns": col_names,
+                            "sample_rows": [
+                                dict(zip(sample_cols, row))
+                                for row in sample_rows[:5]
+                            ]
+                        })
+                except Exception:
+                    continue
+        
+        cur.close()
+        conn.close()
+        
+        return {
+            "analysis": results,
+            "recommendations": [
+                f"Found {len(results['found_tables'])} relevant tables",
+                f"Found {len(results['found_columns'])} relevant columns",
+                "Use 'preview_rows' or 'run_query_safe' to explore specific tables"
+            ]
+        }
+        
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        cur.close()
+        conn.close()
+        return {"error": str(e), "partial_results": results}
+
+
+# ---------------------------------------------------------
+# Tool: find_data_by_value - Find tables/rows containing specific values
+# ---------------------------------------------------------
+
+@mcp.tool()
+def find_data_by_value(search_value: str, data_type: str = "text") -> dict:
+    """
+    Find which tables and rows contain a specific value.
+    Searches across all tables in interesting schemas.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    
+    results = {
+        "search_value": search_value,
+        "matches": []
+    }
+    
+    try:
+        # Get all interesting schemas
+        cur.execute("""
+            SELECT schema_name
+            FROM information_schema.schemata
+            WHERE schema_name LIKE 'collections_%'
+               OR schema_name LIKE 'recovery_%'
+               OR schema_name = 'gold'
+            ORDER BY schema_name;
+        """)
+        
+        schemas = [row[0] for row in cur.fetchall()]
+        
+        for schema in schemas[:5]:  # Limit to first 5 schemas for performance
+            try:
+                # Get all tables in schema
+                cur.execute("""
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = %s
+                    AND table_type = 'BASE TABLE'
+                    ORDER BY table_name;
+                """, (schema,))
+                
+                tables = [row[0] for row in cur.fetchall()]
+                
+                for table in tables[:10]:  # Limit tables per schema
+                    try:
+                        # Get text columns
+                        cur.execute("""
+                            SELECT column_name
+                            FROM information_schema.columns
+                            WHERE table_schema = %s
+                            AND table_name = %s
+                            AND data_type IN ('text', 'varchar', 'character varying', 'char')
+                            LIMIT 5;
+                        """, (schema, table))
+                        
+                        text_cols = [row[0] for row in cur.fetchall()]
+                        
+                        if text_cols:
+                            # Search in these columns
+                            conditions = " OR ".join([f"{col}::text ILIKE %s" for col in text_cols])
+                            query = f"""
+                                SELECT COUNT(*) as match_count
+                                FROM {schema}.{table}
+                                WHERE {conditions}
+                                LIMIT 1;
+                            """
+                            
+                            cur.execute(query, tuple([f"%{search_value}%"] * len(text_cols)))
+                            count = cur.fetchone()[0]
+                            
+                            if count > 0:
+                                results["matches"].append({
+                                    "schema": schema,
+                                    "table": table,
+                                    "match_count": count,
+                                    "searched_columns": text_cols
+                                })
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        
+        cur.close()
+        conn.close()
+        
+        return {
+            "search_value": search_value,
+            "total_matches": len(results["matches"]),
+            "matches": results["matches"][:20]  # Limit results
+        }
+        
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        cur.close()
+        conn.close()
+        return {"error": str(e)}
+
+
+# ---------------------------------------------------------
 # Run server
 # ---------------------------------------------------------
 

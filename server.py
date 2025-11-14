@@ -1,7 +1,7 @@
 import os
 import psycopg2
 import re
-from fastmcp import MCPServer, tool
+from fastmcp import FastMCP
 
 
 # ---------------------------------------------------------
@@ -18,14 +18,14 @@ def get_conn():
     )
 
 
-server = MCPServer("db-xplorer")
+mcp = FastMCP("db-xplorer")
 
 
 # ---------------------------------------------------------
 # Tool: list_schemas
 # ---------------------------------------------------------
 
-@tool
+@mcp.tool()
 def list_schemas() -> dict:
     conn = get_conn()
     cur = conn.cursor()
@@ -51,7 +51,7 @@ def list_schemas() -> dict:
 # Tool: list_tables
 # ---------------------------------------------------------
 
-@tool
+@mcp.tool()
 def list_tables(schema: str) -> dict:
     conn = get_conn()
     cur = conn.cursor()
@@ -93,7 +93,7 @@ def list_tables(schema: str) -> dict:
 # Tool: describe_table
 # ---------------------------------------------------------
 
-@tool
+@mcp.tool()
 def describe_table(schema: str, table: str) -> dict:
     conn = get_conn()
     cur = conn.cursor()
@@ -188,7 +188,7 @@ def describe_table(schema: str, table: str) -> dict:
 # Tool: search_columns
 # ---------------------------------------------------------
 
-@tool
+@mcp.tool()
 def search_columns(pattern: str) -> dict:
     conn = get_conn()
     cur = conn.cursor()
@@ -222,7 +222,7 @@ def search_columns(pattern: str) -> dict:
 # Tool: preview_rows
 # ---------------------------------------------------------
 
-@tool
+@mcp.tool()
 def preview_rows(schema: str, table: str, limit: int = 20) -> dict:
     conn = get_conn()
     cur = conn.cursor()
@@ -245,7 +245,7 @@ def preview_rows(schema: str, table: str, limit: int = 20) -> dict:
 # Tool: get_row_count
 # ---------------------------------------------------------
 
-@tool
+@mcp.tool()
 def get_row_count(schema: str, table: str) -> dict:
     conn = get_conn()
     cur = conn.cursor()
@@ -284,7 +284,7 @@ BLOCK_PATTERNS = [
 ]
 
 
-@tool
+@mcp.tool()
 def run_query_safe(sql: str) -> dict:
     cleaned = sql.lower().strip()
 
@@ -329,5 +329,5 @@ def run_query_safe(sql: str) -> dict:
 # ---------------------------------------------------------
 
 if __name__ == "__main__":
-    server.run()
+    mcp.run()
 

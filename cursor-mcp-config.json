@@ -3,14 +3,14 @@
     "db-xplorer": {
       "command": "python",
       "args": [
-        "C:\\Users\\monis\\OneDrive\\Desktop\\Indilabs.ai\\Chatbot 2.0\\db-xplorer\\server.py"
+        "C:\\Users\\monis\\OneDrive\\Desktop\\Indilabs.ai\\Chatbot 2.0\\DB-Xplorer\\server.py"
       ],
       "env": {
-        "DB_HOST": "YOUR_DB_HOST_HERE",
+        "DB_HOST": "riskubesharednpdb01.postgres.database.azure.com",
         "DB_PORT": "5432",
-        "DB_NAME": "YOUR_DB_NAME_HERE",
-        "DB_USER": "YOUR_DB_USER_HERE",
-        "DB_PASSWORD": "YOUR_DB_PASSWORD_HERE"
+        "DB_NAME": "riskubecl01uat_db",
+        "DB_USER": "pgsqladmin",
+        "DB_PASSWORD": "d8EeuK:3:_rNQVK"
       }
     }
   }

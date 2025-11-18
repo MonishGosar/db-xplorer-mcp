@@ -1,6 +1,10 @@
 import os
 import psycopg2
 import re
+import time
+import threading
+from contextlib import contextmanager
+from psycopg2.pool import ThreadedConnectionPool
 from fastmcp import FastMCP
 from difflib import SequenceMatcher
 
@@ -9,32 +13,227 @@ from difflib import SequenceMatcher
 # DB Connection
 # ---------------------------------------------------------
 
-def get_conn():
-    def clean_env_var(value, default=None):
-        """Strip quotes and whitespace from environment variable values"""
-        if value is None:
-            return default
-        # Remove surrounding quotes (single or double) and strip whitespace
-        value = value.strip().strip('"').strip("'")
-        return value if value else default
-    
-    def get_port():
-        port = clean_env_var(os.environ.get("DB_PORT"), "5432")
+POOL_LOCK = threading.Lock()
+CONNECTION_POOL: ThreadedConnectionPool | None = None
+
+CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "300"))
+METADATA_CACHE = {
+    "schemas": {"data": [], "timestamp": 0},
+    "tables": {},  # schema -> {"data": [table_names], "timestamp": ts}
+    "table_to_schema": {}  # table_name -> set([schemas])
+}
+CACHE_LOCK = threading.Lock()
+
+CONTEXT_STATE = {
+    "last_schema": None,
+    "last_table": None
+}
+
+
+def clean_env_var(value, default=None):
+    """Strip quotes and whitespace from environment variable values"""
+    if value is None:
+        return default
+    # Remove surrounding quotes (single or double) and strip whitespace
+    value = value.strip().strip('"').strip("'")
+    return value if value else default
+
+
+def get_port_value():
+    port = clean_env_var(os.environ.get("DB_PORT"), "5432")
+    try:
+        return int(port)
+    except (ValueError, TypeError):
+        return 5432
+
+
+def init_connection_pool():
+    global CONNECTION_POOL
+    with POOL_LOCK:
+        if CONNECTION_POOL is None:
+            min_conn = int(os.environ.get("DB_POOL_MIN", "1"))
+            max_conn = int(os.environ.get("DB_POOL_MAX", "5"))
+            CONNECTION_POOL = ThreadedConnectionPool(
+                minconn=min_conn,
+                maxconn=max_conn,
+                host=clean_env_var(os.environ.get("DB_HOST")),
+                port=get_port_value(),
+                dbname=clean_env_var(os.environ.get("DB_NAME")),
+                user=clean_env_var(os.environ.get("DB_USER")),
+                password=clean_env_var(os.environ.get("DB_PASSWORD"))
+            )
+
+
+def release_conn(conn):
+    if conn is None:
+        return
+    raw = getattr(conn, "_raw", None)
+    if raw is None:
         try:
-            return int(port)
-        except (ValueError, TypeError):
-            return 5432
-    
-    conn = psycopg2.connect(
-        host=clean_env_var(os.environ.get("DB_HOST")),
-        port=get_port(),
-        dbname=clean_env_var(os.environ.get("DB_NAME")),
-        user=clean_env_var(os.environ.get("DB_USER")),
-        password=clean_env_var(os.environ.get("DB_PASSWORD"))
-    )
-    # Enable autocommit for read-only queries to avoid transaction aborted errors
-    conn.autocommit = True
-    return conn
+            conn.close()
+        except Exception:
+            pass
+        return
+    if CONNECTION_POOL:
+        CONNECTION_POOL.putconn(raw)
+
+
+class PooledConnection:
+    def __init__(self, raw_conn):
+        self._raw = raw_conn
+
+    def __getattr__(self, item):
+        return getattr(self._raw, item)
+
+    def close(self):
+        release_conn(self)
+        self._raw = None
+
+
+def get_conn():
+    if CONNECTION_POOL is None:
+        init_connection_pool()
+    raw = CONNECTION_POOL.getconn()
+    raw.autocommit = True
+    return PooledConnection(raw)
+
+
+# ---------------------------------------------------------
+# Metadata caching helpers
+# ---------------------------------------------------------
+
+
+def _is_cache_valid(entry):
+    if not entry or not entry.get("data"):
+        return False
+    return (time.time() - entry.get("timestamp", 0)) < CACHE_TTL_SECONDS
+
+
+def _update_table_to_schema_map(schema, table_names):
+    with CACHE_LOCK:
+        for name in table_names:
+            if name not in METADATA_CACHE["table_to_schema"]:
+                METADATA_CACHE["table_to_schema"][name] = set()
+            METADATA_CACHE["table_to_schema"][name].add(schema)
+
+
+def get_cached_schemas(conn=None, force_refresh=False):
+    with CACHE_LOCK:
+        entry = METADATA_CACHE["schemas"]
+        if not force_refresh and _is_cache_valid(entry):
+            return entry["data"]
+
+    close_conn = False
+    if conn is None:
+        conn = get_conn()
+        close_conn = True
+
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT schema_name
+        FROM information_schema.schemata
+        WHERE schema_name LIKE 'collections_%'
+           OR schema_name LIKE 'recovery_%'
+           OR schema_name = 'gold'
+        ORDER BY schema_name;
+    """)
+    schemas = [row[0] for row in cur.fetchall()]
+    cur.close()
+
+    if close_conn:
+        conn.close()
+
+    with CACHE_LOCK:
+        METADATA_CACHE["schemas"] = {"data": schemas, "timestamp": time.time()}
+
+    return schemas
+
+
+def get_cached_table_names(schema, conn=None, force_refresh=False):
+    with CACHE_LOCK:
+        entry = METADATA_CACHE["tables"].get(schema)
+        if entry and not force_refresh and _is_cache_valid(entry):
+            return entry["data"]
+
+    close_conn = False
+    if conn is None:
+        conn = get_conn()
+        close_conn = True
+
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = %s
+          AND table_type = 'BASE TABLE'
+        ORDER BY table_name;
+    """, (schema,))
+    names = [row[0] for row in cur.fetchall()]
+    cur.close()
+
+    if close_conn:
+        conn.close()
+
+    with CACHE_LOCK:
+        METADATA_CACHE["tables"][schema] = {"data": names, "timestamp": time.time()}
+    _update_table_to_schema_map(schema, names)
+
+    return names
+
+
+def update_table_cache_from_results(schema, table_names):
+    if not table_names:
+        return
+    with CACHE_LOCK:
+        entry = METADATA_CACHE["tables"].get(schema, {"data": [], "timestamp": 0})
+        existing = set(entry.get("data", []))
+        existing.update(table_names)
+        METADATA_CACHE["tables"][schema] = {"data": list(existing), "timestamp": time.time()}
+    _update_table_to_schema_map(schema, table_names)
+
+
+def refresh_table_schema_map(conn=None):
+    schemas = get_cached_schemas(conn=conn)
+    for schema in schemas:
+        get_cached_table_names(schema, conn=conn, force_refresh=True)
+
+
+def update_context(schema=None, table=None):
+    if schema:
+        CONTEXT_STATE["last_schema"] = schema
+    if table:
+        CONTEXT_STATE["last_table"] = table
+
+
+def find_table_across_schemas(table, conn=None):
+    with CACHE_LOCK:
+        schema_set = METADATA_CACHE["table_to_schema"].get(table)
+        if schema_set:
+            return [{"schema": s, "table": table} for s in schema_set]
+
+    close_conn = False
+    if conn is None:
+        conn = get_conn()
+        close_conn = True
+
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT table_schema, table_name
+        FROM information_schema.tables
+        WHERE table_name = %s
+          AND table_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
+        ORDER BY table_schema;
+    """, (table,))
+    rows = cur.fetchall()
+    cur.close()
+
+    if close_conn:
+        conn.close()
+
+    for schema_name, table_name in rows:
+        update_table_cache_from_results(schema_name, [table_name])
+
+    return [{"schema": row[0], "table": row[1]} for row in rows]
 
 
 mcp = FastMCP("db-xplorer")
@@ -142,23 +341,7 @@ def check_table_exists(schema: str, table: str, conn=None):
 
 @mcp.tool()
 def list_schemas() -> dict:
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT schema_name
-        FROM information_schema.schemata
-        WHERE schema_name LIKE 'collections_%'
-           OR schema_name LIKE 'recovery_%'
-           OR schema_name = 'gold'
-        ORDER BY schema_name;
-    """)
-
-    schemas = [row[0] for row in cur.fetchall()]
-
-    cur.close()
-    conn.close()
-
+    schemas = get_cached_schemas()
     return {"schemas": schemas}
 
 
@@ -197,7 +380,9 @@ def list_tables(schema: str) -> dict:
     """, (schema,))
 
     result = []
+    table_names_for_cache = []
     for table_name, estimate in cur.fetchall():
+        table_names_for_cache.append(table_name)
         result.append({
             "table_name": table_name,
             "row_estimate": int(estimate),
@@ -206,6 +391,7 @@ def list_tables(schema: str) -> dict:
 
     cur.close()
     conn.close()
+    update_table_cache_from_results(schema, table_names_for_cache)
     return {"tables": result}
 
 
@@ -336,6 +522,8 @@ def describe_table(schema: str, table: str) -> dict:
     cur.close()
     conn.close()
 
+    update_context(schema, table)
+
     return {
         "schema": schema,
         "table": table,
@@ -398,13 +586,6 @@ def check_table_exists(schema: str, table: str, conn=None):
     Returns suggestions for similar table names if not found.
     Also searches other schemas if table not found in specified schema.
     """
-    if conn is None:
-        conn = get_conn()
-        should_close = True
-    else:
-        should_close = False
-    
-    cur = conn.cursor()
     result = {
         "exists": False,
         "schema": schema,
@@ -413,84 +594,50 @@ def check_table_exists(schema: str, table: str, conn=None):
         "suggestions": [],
         "similar_tables": []
     }
-    
+
     try:
-        # First, check if table exists in the specified schema
-        cur.execute("""
-            SELECT table_name
-            FROM information_schema.tables
-            WHERE table_schema = %s AND table_name = %s;
-        """, (schema, table))
-        
-        if cur.fetchone():
-            result["exists"] = True
-            result["actual_schema"] = schema
-            if should_close:
-                cur.close()
-                conn.close()
-            return result
-        
-        # Table not found in specified schema - search for similar names
-        # 1. Search in the same schema for similar table names
-        cur.execute("""
-            SELECT table_name
-            FROM information_schema.tables
-            WHERE table_schema = %s
-            AND table_name ILIKE %s
-            ORDER BY table_name
-            LIMIT 10;
-        """, (schema, f"%{table}%"))
-        
-        similar_in_schema = [row[0] for row in cur.fetchall()]
-        result["suggestions"].extend([f"{schema}.{t}" for t in similar_in_schema])
-        
-        # 2. Search in ALL schemas for this table name
-        cur.execute("""
-            SELECT table_schema, table_name
-            FROM information_schema.tables
-            WHERE table_name = %s
-            AND table_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
-            ORDER BY table_schema;
-        """, (table,))
-        
-        found_in_schemas = cur.fetchall()
-        if found_in_schemas:
-            result["similar_tables"] = [{"schema": row[0], "table": row[1]} for row in found_in_schemas]
-            result["suggestions"].extend([f"{row[0]}.{row[1]}" for row in found_in_schemas])
-            result["message"] = f"Table '{table}' not found in schema '{schema}', but found in: {', '.join([row[0] for row in found_in_schemas])}"
-        
-        # 3. Search for similar table names across all schemas
-        cur.execute("""
-            SELECT table_schema, table_name
-            FROM information_schema.tables
-            WHERE table_name ILIKE %s
-            AND table_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
-            ORDER BY table_schema, table_name
-            LIMIT 15;
-        """, (f"%{table}%",))
-        
-        similar_all = cur.fetchall()
-        for row in similar_all:
-            suggestion = f"{row[0]}.{row[1]}"
-            if suggestion not in result["suggestions"]:
-                result["suggestions"].append(suggestion)
-        
-        if not result["suggestions"]:
-            result["message"] = f"Table '{schema}.{table}' does not exist. Use 'list_tables' to see available tables in schema '{schema}'"
-        elif not result["similar_tables"]:
-            result["message"] = f"Table '{table}' not found in schema '{schema}'. Similar tables: {', '.join(result['suggestions'][:5])}"
-        else:
-            result["message"] = f"Table '{table}' not in schema '{schema}'. Found in: {', '.join([t['schema'] for t in result['similar_tables']])}"
-        
+        table_names = get_cached_table_names(schema, conn=conn)
     except Exception as e:
         result["message"] = f"Error checking table: {str(e)}"
-    finally:
-        if should_close:
-            cur.close()
-            conn.close()
-        else:
-            cur.close()
-    
+        return result
+
+    if table in table_names:
+        result["exists"] = True
+        result["actual_schema"] = schema
+        return result
+
+    # Similar names within same schema
+    similar_in_schema = [name for name in table_names if table.lower() in name.lower()]
+    if not similar_in_schema:
+        # fallback to fuzzy match using SequenceMatcher
+        similar_in_schema = sorted(
+            table_names,
+            key=lambda name: similarity(name, table),
+            reverse=True
+        )[:5]
+
+    result["suggestions"].extend([f"{schema}.{name}" for name in similar_in_schema])
+
+    # Find table in other schemas using cache/DB
+    found_elsewhere = find_table_across_schemas(table, conn=conn)
+    if found_elsewhere:
+        result["similar_tables"] = found_elsewhere
+        result["suggestions"].extend([f"{entry['schema']}.{entry['table']}" for entry in found_elsewhere])
+        result["message"] = (
+            f"Table '{table}' not found in schema '{schema}', but exists in: "
+            f"{', '.join({entry['schema'] for entry in found_elsewhere})}"
+        )
+    elif result["suggestions"]:
+        result["message"] = (
+            f"Table '{table}' not found in schema '{schema}'. "
+            f"Similar tables: {', '.join(result['suggestions'][:5])}"
+        )
+    else:
+        result["message"] = (
+            f"Table '{schema}.{table}' does not exist. "
+            f"Use 'list_tables' to inspect schema '{schema}' or 'find_table_schema' to locate the table."
+        )
+
     return result
 
 
@@ -613,6 +760,8 @@ def preview_rows(schema: str, table: str, limit: int = 20) -> dict:
         cur.close()
         conn.close()
 
+        update_context(schema, table)
+
         return {
             "schema": schema,
             "table": table,
@@ -686,6 +835,8 @@ def get_row_count(schema: str, table: str) -> dict:
 
         cur.close()
         conn.close()
+
+        update_context(schema, table)
 
         return {"row_estimate": estimate, "row_exact": exact}
     except Exception as e:
@@ -966,6 +1117,8 @@ def deep_search(schema: str, table: str, search_term: str, limit: int = 100) -> 
         cur.close()
         conn.close()
         
+        update_context(schema, table)
+
         return {
             "schema": schema,
             "table": table,
@@ -1068,6 +1221,11 @@ def analyze_data(query: str, date_filter: str = None) -> dict:
     
     # Extract keywords flexibly
     keywords, phrases = extract_keywords_flexible(query)
+    if not keywords:
+        if CONTEXT_STATE.get("last_table"):
+            keywords.append(CONTEXT_STATE["last_table"])
+        elif CONTEXT_STATE.get("last_schema"):
+            keywords.append(CONTEXT_STATE["last_schema"])
     
     # Extract date information (more flexible)
     date_patterns = {
@@ -1488,6 +1646,183 @@ def verify_table_exists(schema: str, table: str) -> dict:
             "error": result.get("message", f"Table '{schema}.{table}' does not exist"),
             "suggestions": result.get("suggestions", []),
             "hint": f"Did you mean one of these? {', '.join(result.get('suggestions', [])[:10])}" if result.get("suggestions") else f"Use 'list_tables' with schema '{schema}' to see all available tables"
+        }
+
+
+# ---------------------------------------------------------
+# Tool: portfolio_query - Query portfolio data with structured parameters
+# ---------------------------------------------------------
+
+@mcp.tool()
+def portfolio_query(
+    from_month: str,
+    to_month: str,
+    group_by: list[str],
+    metrics: list[str],
+    product_name: str = None,
+    filters: dict = None
+) -> dict:
+    """
+    Query portfolio data from collections_portfolio.monthly_snapshot table.
+    This tool prevents raw SQL injection by accepting only structured parameters.
+    
+    Args:
+        from_month: Start month in YYYY-MM format (e.g., "2025-07")
+        to_month: End month in YYYY-MM format (e.g., "2025-09")
+        group_by: List of dimensions to group by. Allowed values: ["file_month", "region", "bucket", "vintage_band"]
+        metrics: List of metrics to calculate. Allowed values: ["pos", "one_plus_balance", "recovery_rate", "flow_rate_b1_b2", "rate_loss_value", "rate_loss_bps"]
+        product_name: Optional product name filter (e.g., "PL Self")
+        filters: Optional dict of additional filters (e.g., {"bucket": "B2", "region": "West"})
+    
+    Returns:
+        Dictionary with query results containing columns and rows
+    """
+    # Validate required parameters are not empty
+    if not group_by:
+        return {
+            "error": "group_by cannot be empty. Provide at least one dimension to group by.",
+            "allowed_values": ["file_month", "region", "bucket", "vintage_band"]
+        }
+    
+    if not metrics:
+        return {
+            "error": "metrics cannot be empty. Provide at least one metric to calculate.",
+            "allowed_values": ["pos", "one_plus_balance", "recovery_rate", "flow_rate_b1_b2", "rate_loss_value", "rate_loss_bps"]
+        }
+    
+    # Validate group_by values
+    allowed_group_by = ["file_month", "region", "bucket", "vintage_band"]
+    invalid_group_by = [g for g in group_by if g not in allowed_group_by]
+    if invalid_group_by:
+        return {
+            "error": f"Invalid group_by values: {invalid_group_by}. Allowed values: {allowed_group_by}",
+            "allowed_values": allowed_group_by
+        }
+    
+    # Validate metrics
+    allowed_metrics = ["pos", "one_plus_balance", "recovery_rate", "flow_rate_b1_b2", "rate_loss_value", "rate_loss_bps"]
+    invalid_metrics = [m for m in metrics if m not in allowed_metrics]
+    if invalid_metrics:
+        return {
+            "error": f"Invalid metrics: {invalid_metrics}. Allowed values: {allowed_metrics}",
+            "allowed_values": allowed_metrics
+        }
+    
+    # Validate date format (YYYY-MM)
+    date_pattern = r"^\d{4}-\d{2}$"
+    if not re.match(date_pattern, from_month):
+        return {"error": f"Invalid from_month format: {from_month}. Expected YYYY-MM format"}
+    if not re.match(date_pattern, to_month):
+        return {"error": f"Invalid to_month format: {to_month}. Expected YYYY-MM format"}
+    
+    # Define aggregation functions for each metric
+    # SUM for additive metrics, AVG for rates
+    aggregation_map = {
+        "pos": "SUM",
+        "one_plus_balance": "SUM",
+        "recovery_rate": "AVG",
+        "flow_rate_b1_b2": "AVG",
+        "rate_loss_value": "SUM",
+        "rate_loss_bps": "AVG"
+    }
+    
+    conn = get_conn()
+    cur = conn.cursor()
+    
+    try:
+        # Build SELECT clause - include group_by columns and aggregated metrics
+        select_parts = list(group_by)
+        for metric in metrics:
+            agg_func = aggregation_map.get(metric, "SUM")
+            select_parts.append(f"{agg_func}({metric}) AS {metric}")
+        
+        select_clause = ", ".join(select_parts)
+        
+        # Build WHERE clause
+        where_conditions = [
+            "file_month >= %s",
+            "file_month <= %s"
+        ]
+        params = [from_month, to_month]
+        
+        # Add product_name filter if provided
+        if product_name:
+            where_conditions.append("product_name = %s")
+            params.append(product_name)
+        
+        # Add additional filters if provided
+        if filters:
+            # Validate filter keys against allowed group_by values
+            allowed_filters = allowed_group_by + ["product_name"]
+            for filter_key, filter_value in filters.items():
+                # Skip product_name if it's already handled as a parameter
+                if filter_key == "product_name" and product_name:
+                    continue
+                if filter_key in allowed_filters:
+                    # Only add filter if value is not None
+                    if filter_value is not None and filter_value != "":
+                        where_conditions.append(f"{filter_key} = %s")
+                        params.append(filter_value)
+                else:
+                    # Skip invalid filter keys
+                    pass
+        
+        where_clause = " AND ".join(where_conditions)
+        
+        # Build GROUP BY clause
+        group_by_clause = ", ".join(group_by) if group_by else "1"
+        
+        # Build final SQL query
+        sql = f"""
+            SELECT {select_clause}
+            FROM collections_portfolio.monthly_snapshot
+            WHERE {where_clause}
+            GROUP BY {group_by_clause}
+            ORDER BY {group_by_clause}
+        """
+        
+        # Execute query
+        cur.execute(sql, params)
+        
+        # Get column names
+        columns = [desc[0] for desc in cur.description]
+        
+        # Fetch all rows
+        rows = cur.fetchall()
+        
+        # Convert rows to list of dicts for easier consumption
+        results = []
+        for row in rows:
+            results.append(dict(zip(columns, row)))
+        
+        cur.close()
+        conn.close()
+        
+        return {
+            "columns": columns,
+            "rows": results,
+            "row_count": len(results),
+            "query_params": {
+                "from_month": from_month,
+                "to_month": to_month,
+                "product_name": product_name,
+                "group_by": group_by,
+                "metrics": metrics,
+                "filters": filters
+            }
+        }
+        
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        cur.close()
+        conn.close()
+        
+        return {
+            "error": str(e),
+            "message": "Error executing portfolio query. Check table exists and parameters are correct."
         }
 
 

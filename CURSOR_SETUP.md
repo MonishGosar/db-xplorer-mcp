@@ -177,17 +177,24 @@ If you've deployed to FastMCP Cloud, you can connect to it via HTTP:
 
 Once deployed, these tools will be available in Cursor:
 
-1. **list_schemas** - List all schemas
-2. **list_tables** - List tables in a schema
-3. **describe_table** - Get table details
-4. **search_columns** - Search for columns
-5. **preview_rows** - Preview table data
-6. **get_row_count** - Get row counts
-7. **run_query_safe** - Run safe SELECT queries
-8. **smart_search** - Comprehensive search
-9. **deep_search** - Search inside table data
-10. **analyze_data** - Natural language analysis
-11. **find_data_by_value** - Find data by value
+### Portfolio Query Tool (v0 - CRO Bot)
+1. **portfolio_query** - Query portfolio data from `collections_portfolio.monthly_snapshot` table
+   - Accepts structured parameters (from_month, to_month, group_by, metrics, product_name, filters)
+   - Prevents SQL injection with validated inputs
+   - Returns aggregated portfolio data
+
+### Database Exploration Tools
+2. **list_schemas** - List all schemas
+3. **list_tables** - List tables in a schema
+4. **describe_table** - Get table details
+5. **search_columns** - Search for columns
+6. **preview_rows** - Preview table data
+7. **get_row_count** - Get row counts
+8. **run_query_safe** - Run safe SELECT queries
+9. **smart_search** - Comprehensive search
+10. **deep_search** - Search inside table data
+11. **analyze_data** - Natural language analysis
+12. **find_data_by_value** - Find data by value
 
 ---
 
@@ -195,13 +202,29 @@ Once deployed, these tools will be available in Cursor:
 
 After setup, try this in Cursor chat:
 
+### Portfolio Query Examples:
+```
+How is PL Self doing in B2 over the last 3 months?
+```
+
+```
+How has rate loss changed in PL Self B2 in West in last 3 months?
+```
+
+```
+Show me recovery rate trends for PL Self by region for the last quarter
+```
+
+### General Database Exploration:
 ```
 Use the analyze_data tool to find information about prediction data for november 2023
 ```
 
-Or:
-
 ```
 List all schemas in the database and show me tables in the first schema
 ```
+
+## See Also
+
+For detailed setup instructions, see: **SETUP_CLAUDE_MCP.md**
 
